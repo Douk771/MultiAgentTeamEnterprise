@@ -441,7 +441,7 @@ if (mergeReview.hasBlockingFindings || newBugs(mergeRegression).length > 0 || !m
   await parallel(fixCalls(
     [...mergeReview.findings.filter(f => f.severity === 'blocking'), ...newBugs(mergeRegression), ...mergeContract.violations],
     `Проблемы после интеграции develop → cycle:\nРевью:\n${formatReview(mergeReview)}\n\nРегрессия:\n${formatQA(mergeRegression)}\n\nКонтракт:\n${formatContract(mergeContract)}`,
-    'fix-merge', 'Integrate'))
+    'fix-merge', 'Sync'))
   ;[mergeReview, mergeRegression, mergeContract] = await parallel([
     () => agent(`${AUTOMATED_CONTEXT}\n\nПовторно проверь diff мерджа после исправлений.`,
       { label: 'code-reviewer:merge-recheck', phase: 'Sync', agentType: 'code-reviewer', effort: REVIEW_EFFORT, schema: REVIEW_SCHEMA }),
