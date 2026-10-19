@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# pre-commit: механический контроль поверх инструкций в промптах агентов
+# (история решения — в docs/HISTORY.md). Работает независимо от того, какой
+# агент (или человек) делает коммит — git не различает авторов внутри одной
+# рабочей копии, поэтому проверяем СОДЕРЖИМОЕ и СОСТОЯНИЕ, а не то, "кто"
+# коммитит.
+#
+# Установка (один раз на репозиторий):
+#   git config core.hooksPath .githooks
+# (devops-engineer делает это сам при подготовке репозитория — Вызов 0 в его
+# роли.)
+
+set -euo pipefail
+
+PROTECTED_BRANCHES_RE='^(develop|release-candidate|master|main)$'
+
+# 1) Защита веток: прямой коммит правок в защищённую ветку запрещён — вся
+# работа идёт в cycle/<NNN>-<slug>, а в develop/release-candidate/master
+# правки попадают только --ff-only мерджем от devops-engineer (см. README,
+# "Ветки и релизы"). Коммит во время git merge (существует MERGE_HEAD) здесь
+# пропускаем — разрешение конфликтов при sync develop → cycle тоже идёт через
+# этот путь. Не-ff мердж прямо в защищённую ветку этим исключением не
+# легализуется: его ловят правило --ff-only у devops-engineer и pre-push (у
+# нового merge-коммита нет прогона CI, пуш заблокируется).
+current_branch="$(git symbolic-ref --short HEAD 2>/dev/null || echo '')"
+git_dir="$(git rev-parse --git-dir)"
+
+if [[ "$current_branch" =~ $PROTECTED_BRANCHES_RE ]]; then
+  if [ ! -f "$git_dir/MERGE_HEAD" ]; then
+    echo "❌ Прямой коммит в защищённую ветку '$current_branch' заблокирован."
+    echo "   Правки сюда попадают только --ff-only мерджем cycle-ветки (зона devops-engineer)."
+    echo "   Закоммитьте изменения на текущей cycle/<NNN>-<slug> ветке."
+    exit 1
+  fi
+fi
+
+# 2) Сканирование секретов в застейдженных изменениях. Предпочитаем gitleaks,
+# если он установлен — он умеет намного больше, чем несколько regex ниже.
+# gitleaks >= 8.19: 'gitleaks git --staged'; более старые: 'gitleaks protect --staged'.
+if command -v gitleaks >/dev/null 2>&1; then
+  # Наличие подкоманды определяем по списку "Available Commands" в справке.
+  if gitleaks --help 2>/dev/null | grep -Eq '^[[:space:]]+git[[:space:]]'; then
+    gitleaks_cmd=(gitleaks git --staged --redact --no-banner)
+  else
+    gitleaks_cmd=(gitleaks protect --staged --redact --no-banner)
+  fi
+  if ! "${gitleaks_cmd[@]}"; then
+    echo "❌ gitleaks нашёл похожее на секрет в застейдженных изменениях — коммит заблокирован."
+    exit 1
+  fi
+else
+  echo "⚠️  gitleaks не установлен — используется упрощённая встроенная проверка"
+  echo "   (см. .githooks/README.md). Рекомендуется установить gitleaks:"
+  echo "   https://github.com/gitleaks/gitleaks"
+
+  staged_diff="$(git diff --cached -U0 --diff-filter=ACM -- . ':(exclude).githooks/*' || true)"
+  if [ -n "$staged_diff" ] && echo "$staged_diff" | grep -E -q \
+    -e 'AKIA[0-9A-Z]{16}' \
+    -e '-----BEGIN (RSA|EC|OPENSSH|PGP) PRIVATE KEY-----' \
+    -e '(api[_-]?key|secret|token|passwd|password)["'"'"']?[[:space:]]*[:=][[:space:]]*["'"'"'][A-Za-z0-9/+_.-]{16,}["'"'"']' \
+    ; then
+    echo "❌ Похоже на секрет в застейдженных изменениях (встроенная проверка) — коммит заблокирован."
+    echo "   Если это ложное срабатывание — уберите совпавшую строку из этого коммита"
+    echo "   и, при необходимости, вынесите значение в переменные окружения/секреты."
+    exit 1
+  fi
+fi
+
+exit 0

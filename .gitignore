@@ -1,0 +1,17 @@
+# macOS
+.DS_Store
+
+# Локальные бэкапы и архивы
+*.tar.gz
+*.zip
+.backup-*
+
+# Python
+__pycache__/
+*.pyc
+
+# Локальные настройки Claude Code (личные разрешения, не для репозитория)
+.claude/settings.local.json
+
+# Метрики и логи прогонов workflow
+*.log

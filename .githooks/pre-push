@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# pre-push: внешнее подтверждение через CI (GitHub Actions) перед тем, как
+# что-либо попадает в защищённую ветку, без модели pull request. История
+# решения — в docs/HISTORY.md.
+#
+# Работает вместе с правилом в devops-engineer.md: мердж в
+# develop/release-candidate/master всегда --ff-only, поэтому SHA, который сюда
+# пушится, — это ровно тот же коммит, что уже был запушен как cycle-ветка (или
+# как develop/release-candidate на предыдущем шаге) и уже прогнан через
+# Actions. Если мердж был не ff — у нового SHA прогонов нет, и пуш блокируется.
+#
+# Пуши в незащищённые ветки (cycle/* и любые другие) хук пропускает сразу, не
+# требуя ни gh, ни сети: gh и репозиторий проверяются лениво, только если среди
+# пушимых ref есть защищённая ветка.
+#
+# Обход: ALLOW_NO_CI_CHECK=1 git push ... — легитимен ТОЛЬКО для первого пуша
+# защищённых веток свежего репозитория, когда CI ещё ни разу не запускался
+# (Вызов 0 devops-engineer — подготовка репозитория). В остальных случаях
+# нужно дождаться зелёного CI на исходной ветке.
+
+set -euo pipefail
+
+PROTECTED_BRANCHES_RE='^refs/heads/(develop|release-candidate|master|main)$'
+ZERO_SHA='0000000000000000000000000000000000000000'
+
+# 1) Сначала читаем ВСЕ ref из stdin и отбираем пуши в защищённые ветки.
+protected_refs=()
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ -n "${remote_ref:-}" ] || continue
+  [[ "$remote_ref" =~ $PROTECTED_BRANCHES_RE ]] || continue
+  [ "$local_sha" = "$ZERO_SHA" ] && continue   # удаление ветки — не наш случай
+  protected_refs+=("$local_sha $remote_ref")
+done
+
+if [ "${#protected_refs[@]}" -eq 0 ]; then
+  exit 0   # ничего защищённого не пушится — проверять нечего
+fi
+
+# Осознанный обход: первый пуш свежего репозитория, когда CI ещё ни разу не
+# запускался (Вызов 0 devops-engineer). Проверяется до любых обращений к gh —
+# иначе коммит без единого прогона проверок всё равно был бы заблокирован ниже.
+if [ "${ALLOW_NO_CI_CHECK:-}" = "1" ]; then
+  echo "⚠️  Проверка CI пропущена по ALLOW_NO_CI_CHECK=1"
+  echo "   (допустимо только для первого пуша свежего репозитория, пока CI ещё не запускался)."
+  exit 0
+fi
+
+# 2) Только теперь требуем gh и определяем репозиторий (один раз).
+# Если проверить CI нельзя, пуш в защищённую ветку БЛОКИРУЕМ, а не пропускаем
+# молча: тихий обход делает гейт декоративным.
+no_check() {
+  echo "❌ $1 — проверить CI-статус нельзя, пуш в защищённую ветку заблокирован."
+  echo "   Установите и авторизуйте gh (gh auth login)."
+  echo "   Первый пуш свежего репозитория, когда CI ещё ни разу не запускался:"
+  echo "   ALLOW_NO_CI_CHECK=1 git push ..."
+  exit 1
+}
+
+if ! command -v gh >/dev/null 2>&1; then
+  no_check "gh (GitHub CLI) не найден"
+fi
+if ! command -v python3 >/dev/null 2>&1; then
+  no_check "python3 не найден (нужен для разбора ответа GitHub API)"
+fi
+
+repo="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || echo '')"
+if [ -z "$repo" ]; then
+  no_check "Не удалось определить репозиторий через 'gh repo view'"
+fi
+
+# 3) Проверяем каждый защищённый ref: check-runs (GitHub Actions и др.) плюс
+# legacy commit statuses (внешние CI, отчитывающиеся через Statuses API).
+for entry in "${protected_refs[@]}"; do
+  local_sha="${entry%% *}"
+  remote_ref="${entry#* }"
+  branch_name="${remote_ref#refs/heads/}"
+  echo "🔎 Проверяю статус CI для коммита $local_sha (пуш в '$branch_name')..."
+
+  runs_json="$(gh api "repos/$repo/commits/$local_sha/check-runs?per_page=100" --jq '.check_runs' 2>/dev/null || echo '[]')"
+  statuses_json="$(gh api "repos/$repo/commits/$local_sha/status" --jq '.statuses' 2>/dev/null || echo '[]')"
+
+  verdict="$(RUNS="$runs_json" STATUSES="$statuses_json" python3 -c '
+import json, os
+def load(name):
+    try:
+        v = json.loads(os.environ.get(name) or "[]")
+        return v if isinstance(v, list) else []
+    except Exception:
+        return None
+runs, statuses = load("RUNS"), load("STATUSES")
+if runs is None or statuses is None:
+    print("ERR"); raise SystemExit
+if not runs and not statuses:
+    print("NONE"); raise SystemExit
+bad = [
+    "%s: status=%s, conclusion=%s" % (r.get("name", "?"), r.get("status"), r.get("conclusion"))
+    for r in runs
+    if not (r.get("status") == "completed" and r.get("conclusion") in ("success", "skipped", "neutral"))
+]
+bad += [
+    "%s: state=%s" % (s.get("context", "?"), s.get("state"))
+    for s in statuses
+    if s.get("state") != "success"
+]
+print("BAD\n" + "\n".join(bad) if bad else "OK")
+' 2>/dev/null || echo "ERR")"
+
+  case "${verdict%%$'\n'*}" in
+    OK)
+      echo "✅ Все проверки CI зелёные для $local_sha — пуш в '$branch_name' разрешён."
+      ;;
+    NONE)
+      echo "❌ Для коммита $local_sha на GitHub нет ни одного прогона проверок."
+      echo "   Сначала запушите исходную ветку (cycle/develop/release-candidate) с этим же"
+      echo "   коммитом и дождитесь зелёного прогона ('gh run watch'), затем мерджите"
+      echo "   --ff-only сюда и пушьте. Если это первый пуш свежего репозитория и CI ещё"
+      echo "   ни разу не запускался: ALLOW_NO_CI_CHECK=1 git push ..."
+      exit 1
+      ;;
+    BAD)
+      echo "❌ Не все проверки CI зелёные для коммита $local_sha:"
+      echo "${verdict#*$'\n'}" | sed 's/^/   - /'
+      echo "   Пуш в защищённую ветку '$branch_name' заблокирован."
+      exit 1
+      ;;
+    *)
+      echo "❌ Не удалось разобрать ответ GitHub API для $local_sha — пуш в '$branch_name' заблокирован."
+      exit 1
+      ;;
+  esac
+done
+
+exit 0
