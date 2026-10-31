@@ -15,9 +15,12 @@
 //
 // Порядок шагов: devops-engineer (cycle-ветка; если develop ещё нет — сам
 // выполняет "Вызов 0 — подготовка репозитория") → codebase-analyst (только для
-// существующего проекта; режим выбирает сам) → qa-engineer (базовый прогон) →
-// product-analyst (SPEC.md) → devops-engineer ("Фиксация документов": SPEC.md
-// коммитится на cycle-ветку).
+// существующего проекта; режим выбирает сам) → product-analyst (SPEC.md) →
+// devops-engineer ("Фиксация документов": SPEC.md коммитится на cycle-ветку).
+// qa-engineer (базовый прогон) для существующего проекта идёт ПАРАЛЛЕЛЬНО
+// этой цепочке — стартует сразу после создания ветки, а результат ждём только
+// перед возвратом: прогон долгий, почти всегда зелёный, и никто на этапе
+// плана его не читает (он нужен только в build-app-implement.js).
 //
 // args: { idea: string, existingProject?: boolean, size?: 'small' }
 // Результат: { branch, currentState, firstOnboarding, baseline, spec, size, docsCommit, blocked }
@@ -86,9 +89,20 @@ const branch = await agent(
   { label: 'devops-engineer:branch', phase: 'Onboarding', agentType: 'devops-engineer', effort: 'low' }
 )
 
+// Базовый прогон тестов — в фоне, параллельно онбордингу и анализу: он только
+// читает и запускает тесты, документы цикла не трогает, а его результат нужен
+// не product-analyst, а этапу реализации. CURRENT_STATE.md в этот момент может
+// ещё писаться — как запускать тесты, qa-engineer при необходимости находит
+// сам (CI-конфиг, скрипты сборки). Ошибка прогона не валит этап плана.
+const baselinePromise = args.existingProject && !budgetLow()
+  ? agent(
+      `Ветка цикла: ${brief(branch, 300, 100)}\n\nЗапусти существующий набор функциональных/e2e-тестов и зафиксируй базовый результат ("Вызов 1 — базовый прогон") по своей роли qa-engineer. CURRENT_STATE.md параллельно с тобой может обновлять codebase-analyst: если его ещё нет или он неполный — как запускать тесты, определи сам по CI-конфигу и скриптам проекта. Файлов в репозитории не создавай и не меняй — результат верни только текстом ответа.`,
+      { label: 'qa-engineer:baseline', phase: 'Onboarding', agentType: 'qa-engineer', effort: 'medium' }
+    ).catch(e => `Базовый прогон не выполнен: ${e && e.message ? e.message : e}`)
+  : Promise.resolve(null)
+
 let currentState = null
 let firstOnboarding = false
-let baseline = null
 if (args.existingProject && !budgetLow()) {
   const state = await agent(
     `Ветка цикла: ${brief(branch, 300, 100)}\n\nПо своей роли codebase-analyst подготовь CURRENT_STATE.md: если файл уже есть — режим "Обновление" (git diff от коммита в его шапке), если нет — "Полное сканирование". Режим выбери сам по правилам своей роли (обычно — по наличию файла) и верни его в поле mode (full/update), как в первой строке отчёта ("Режим: ..."). Изменения закоммить сам на текущей cycle-ветке.`,
@@ -96,22 +110,14 @@ if (args.existingProject && !budgetLow()) {
   )
   currentState = state.summary
   firstOnboarding = state.mode === 'full'
-  if (budgetLow()) {
-    log('Бюджет заканчивается после codebase-analyst — базовый прогон QA не запускаем, нужен человек.')
-    return { branch, currentState, firstOnboarding, baseline, spec: null, size, blocked: 'budget' }
-  }
-  baseline = await agent(
-    `CURRENT_STATE.md лежит в репозитории — читай сам (выжимка:\n${brief(currentState)}).\n\nЗапусти существующий набор функциональных/e2e-тестов и зафиксируй базовый результат ("Вызов 1 — базовый прогон") по своей роли qa-engineer.`,
-    { label: 'qa-engineer:baseline', phase: 'Onboarding', agentType: 'qa-engineer', effort: 'medium' }
-  )
 } else if (args.existingProject && budgetLow()) {
   log('Бюджет заканчивается — пропускаем онбординг существующего проекта, нужен человек.')
-  return { branch, currentState, firstOnboarding, baseline, spec: null, size, blocked: 'budget' }
+  return { branch, currentState, firstOnboarding, baseline: await baselinePromise, spec: null, size, blocked: 'budget' }
 }
 
 if (budgetLow()) {
   log('Бюджет заканчивается перед product-analyst — останавливаемся, нужен человек.')
-  return { branch, currentState, firstOnboarding, baseline, spec: null, size, blocked: 'budget' }
+  return { branch, currentState, firstOnboarding, baseline: await baselinePromise, spec: null, size, blocked: 'budget' }
 }
 
 const spec = await agent(
@@ -132,6 +138,8 @@ if (!budgetLow()) {
 } else {
   log('Бюджет заканчивается — SPEC.md написан, но не закоммичен; зафиксируйте его вручную или фиксацию сделает devops в начале интеграции.')
 }
+
+const baseline = await baselinePromise
 
 log(`SPEC.md готов. Прочитайте его (особенно критичные предположения) перед тем, как запускать build-app-architecture.js — architect получит его как вводную без права сомневаться в ней. Передайте результат этого шага как args следующему${firstOnboarding ? ' (firstOnboarding: true — первое подключение, code-reviewer на этапе реализации сделает базовый аудит)' : ''}.`)
 
